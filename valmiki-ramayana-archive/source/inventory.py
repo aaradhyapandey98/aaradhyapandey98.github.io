@@ -32,7 +32,7 @@ BOOKS = {
     "sundara": ("sundara", 68),
     "yuddha": ("yuddha", 128),
 }
-HTML_EXTENSIONS = {".html", ".htm", ".shtml", ".php", ".cgi", ".old", ".bak", ".orig"}
+HTML_EXTENSIONS = {".html", ".htm", ".shtml", ".php", ".cgi", ".old", ".bak", ".orig", ".css"}
 USER_AGENT = "ValmikiRamayanaInventory/1.0 (+academic preservation audit; no binary downloads)"
 
 
@@ -70,6 +70,15 @@ class LinkParser(HTMLParser):
         for key in ("href", "src", "data", "background"):
             if a.get(key):
                 self.links.append(a[key])  # type: ignore[arg-type]
+        if a.get("srcset"):
+            self.links.extend(item.strip().split()[0]
+                              for item in a["srcset"].split(",") if item.strip())
+        if a.get("style"):
+            self.links.extend(css_links(a["style"]))
+        if tag == "meta" and (a.get("http-equiv") or "").lower() == "refresh":
+            match = re.search(r"url\s*=\s*['\"]?([^'\"]+)", a.get("content") or "", re.I)
+            if match:
+                self.links.append(match.group(1).strip())
         if tag == "a" and a.get("href"):
             self.current_anchor = []
             self.current_href = a["href"]
@@ -82,6 +91,10 @@ class LinkParser(HTMLParser):
         if tag == "a" and self.current_anchor is not None:
             self.anchors.append((self.current_href or "", "".join(self.current_anchor).strip()))
             self.current_anchor, self.current_href = None, None
+
+
+def css_links(css: str) -> list[str]:
+    return [m.group(2) for m in re.finditer(r"url\(\s*(['\"]?)(.*?)\1\s*\)", css, re.I)]
 
 
 @dataclass
@@ -109,7 +122,7 @@ def fetch(url: str, *, max_html_bytes: int) -> tuple[Record, bytes | None, str |
             size = response.headers.get("Content-Length")
             result.content_length = int(size) if size and size.isdigit() else None
             if method == "GET":
-                if result.content_type not in ("text/html", "application/xhtml+xml", "text/plain"):
+                if result.content_type not in ("text/html", "application/xhtml+xml", "text/plain", "text/css"):
                     # An extensionless URL may actually be a binary download.
                     result.method = "HEAD-like GET (headers only)"
                     return result, None, None
@@ -189,6 +202,8 @@ def write_output(output: Path, records: list[Record], edges: list[tuple[str, str
     with (output / "edges.jsonl").open("w", encoding="utf-8") as stream:
         for source, target in edges:
             stream.write(json.dumps({"from": source, "to": target}, ensure_ascii=False) + "\n")
+    (output / "pending.json").write_text(
+        json.dumps(list(pending), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     (output / "reconciliation.json").write_text(
         json.dumps(reconcile(records, edges, base), ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8")
@@ -209,14 +224,38 @@ def write_output(output: Path, records: list[Record], edges: list[tuple[str, str
     }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def restore(output: Path, base: str) -> tuple[dict[str, Record], list[tuple[str, str]], deque[str]] | None:
+    summary = output / "summary.json"
+    if not summary.exists():
+        return None
+    metadata = json.loads(summary.read_text(encoding="utf-8"))
+    if metadata.get("base") != base:
+        raise ValueError(f"Existing audit base {metadata.get('base')!r} differs from {base!r}")
+    records: dict[str, Record] = {}
+    for segment in sorted((output / "segments").glob("*.json")):
+        for row in json.loads(segment.read_text(encoding="utf-8")):
+            rec = Record(**row)
+            records[rec.source_url] = rec
+    edges = [(item["from"], item["to"]) for line in
+             (output / "edges.jsonl").read_text(encoding="utf-8").splitlines()
+             if (item := json.loads(line))]
+    pending = deque(json.loads((output / "pending.json").read_text(encoding="utf-8")))
+    if len(records) != metadata["visited"] or len(edges) != metadata["discovered_link_edges"]:
+        raise ValueError("Audit checkpoint is inconsistent; do not resume without inspection")
+    return records, edges, pending
+
+
 def crawl(base: str, output: Path, max_pages: int, max_seconds: int, delay: float, max_html_bytes: int,
-          segment_size: int) -> None:
+          segment_size: int, fresh: bool = False) -> None:
     base = base.rstrip("/") + "/"
-    queue = deque(seeds(base))
+    saved = None if fresh else restore(output, base)
+    if saved:
+        seen, edges, queue = saved
+        print(f"Resumed {len(seen)} visited URLs, {len(queue)} pending", flush=True)
+    else:
+        seen, edges, queue = {}, [], deque(seeds(base))
     queued = set(queue)
-    seen: dict[str, Record] = {}
-    discovered_from: dict[str, str] = {}
-    edges: list[tuple[str, str]] = []
+    discovered_from = {target: source for source, target in edges if target not in seen}
     start = time.monotonic()
     while queue and len(seen) < max_pages and time.monotonic() - start < max_seconds:
         url = queue.popleft()
@@ -225,18 +264,26 @@ def crawl(base: str, output: Path, max_pages: int, max_seconds: int, delay: floa
         record, data, encoding = fetch(url, max_html_bytes=max_html_bytes)
         record.discovered_from = discovered_from.get(url)
         seen[url] = record
-        if data is not None and record.content_type in ("text/html", "application/xhtml+xml", "text/plain"):
-            parser = LinkParser()
+        if data is not None and record.content_type in ("text/html", "application/xhtml+xml", "text/plain", "text/css"):
             try:
-                parser.feed(data.decode(encoding or "utf-8", errors="replace"))
+                decoded = data.decode(encoding or "utf-8", errors="replace")
             except (LookupError, ValueError):
-                parser.feed(data.decode("utf-8", errors="replace"))
-            for raw in parser.links:
+                decoded = data.decode("utf-8", errors="replace")
+            parser = LinkParser()
+            if record.content_type == "text/css":
+                discovered = css_links(decoded)
+            else:
+                parser.feed(decoded)
+                discovered = parser.links
+            for raw in discovered:
                 target = canonical(urljoin(record.final_url or url, raw), base)
                 if target is not None:
                     edges.append((url, target))
                     if target not in seen and target not in queued:
-                        queue.append(target)
+                        if urlsplit(target).path.endswith("/"):
+                            queue.appendleft(target)
+                        else:
+                            queue.append(target)
                         queued.add(target)
                         discovered_from[target] = url
         if len(seen) % 100 == 0:
@@ -252,6 +299,7 @@ def self_test() -> None:
     p.feed('<a href="sarga1/bala_1_frame.htm">Sarga 1</a><frameset><frame src="text.htm"></frameset>'
            '<img src="x.jpg"><a href="#v1">Verse 1</a>')
     assert p.links == ["sarga1/bala_1_frame.htm", "text.htm", "x.jpg", "#v1"]
+    assert css_links("background:url('../a.png')") == ["../a.png"]
     assert canonical("https://example.org/x#v", "https://example.org/") == "https://example.org/x"
     assert canonical("https://www.example.org/x", "https://example.org/") == "https://www.example.org/x"
     assert canonical("https://other.org/x", "https://example.org/") is None
@@ -276,9 +324,10 @@ if __name__ == "__main__":
     ap.add_argument("--max-html-bytes", type=int, default=2_000_000)
     ap.add_argument("--segment-size", type=int, default=250)
     ap.add_argument("--self-test", action="store_true")
+    ap.add_argument("--fresh", action="store_true", help="Discard an existing audit checkpoint")
     args = ap.parse_args()
     if args.self_test:
         self_test()
     else:
         crawl(args.base, args.output, args.max_pages, args.max_seconds, args.delay, args.max_html_bytes,
-              args.segment_size)
+              args.segment_size, args.fresh)

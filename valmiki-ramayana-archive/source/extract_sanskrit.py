@@ -141,8 +141,10 @@ def extract(raw, book, sarga, kind, expected_count=None):
 
 def fetch(url):
     try:
-        with urlopen(Request(url, headers={"User-Agent": "ValmikiDirectoryAudit/1.0 (text verification)"}),
-                     timeout=30) as response:
+        # The source host has returned a soft block to custom crawl user agents.
+        # Use urllib's ordinary default User-Agent and validate the resulting
+        # HTML for actual sloka classes and VerseN anchors before accepting it.
+        with urlopen(Request(url), timeout=30) as response:
             content_type = response.headers.get_content_type()
             data = response.read(2_000_001)
             if response.status != 200 or content_type not in ("text/html", "application/xhtml+xml") or len(data) > 2_000_000:

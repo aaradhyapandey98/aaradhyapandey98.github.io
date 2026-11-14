@@ -1,0 +1,31 @@
+name: Valmiki markup sample
+on:
+  push:
+    paths: ['.github/workflows/valmiki-sample.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  sample:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Inspect Sanskrit and Roman markup
+        run: |
+          python3 - <<'PY'
+          import re, urllib.request
+          for name,url in [
+            ('sans','https://valmikiramayan.net/utf8/baala/sarga1/balasans1.htm'),
+            ('roman','https://valmikiramayan.net/utf8/baala/sarga1/balaroman1.htm')]:
+              try:
+                with urllib.request.urlopen(url,timeout=20) as r:
+                  raw=r.read(250000)
+                  encoding=r.headers.get_content_charset() or 'utf-8'
+                s=raw.decode(encoding,errors='replace')
+                markers=[m for m in re.finditer(r'[\u0900-\u097f]{3,}|1-1-1|१-१-१',s)]
+                print('SAMPLE',name,'bytes',len(raw),'encoding',encoding,'markers',len(markers))
+                if markers:
+                  p=markers[0].start()
+                  print(s[max(0,p-1000):p+2000])
+              except Exception as e:
+                print('ERROR',name,repr(e))
+          PY

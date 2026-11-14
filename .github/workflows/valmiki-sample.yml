@@ -9,23 +9,19 @@ jobs:
   sample:
     runs-on: ubuntu-latest
     steps:
-      - name: Inspect Sanskrit and Roman markup
+      - name: Diagnose source responses and robots policy
         run: |
           python3 - <<'PY'
-          import re, urllib.request
-          for name,url in [
-            ('sans','https://valmikiramayan.net/utf8/baala/sarga1/balasans1.htm'),
-            ('roman','https://valmikiramayan.net/utf8/baala/sarga1/balaroman1.htm')]:
+          import urllib.request,re
+          urls=['https://valmikiramayan.net/robots.txt','https://valmikiramayan.net/baala/baala_contents.htm']
+          for url in urls:
+            for ua in (None,'ValmikiRamayanaInventory/1.0 (+academic preservation audit; no binary downloads)'):
               try:
-                with urllib.request.urlopen(url,timeout=20) as r:
-                  raw=r.read(250000)
-                  encoding=r.headers.get_content_charset() or 'utf-8'
-                s=raw.decode(encoding,errors='replace')
-                markers=[m for m in re.finditer(r'[\u0900-\u097f]{3,}|1-1-1|१-१-१',s)]
-                print('SAMPLE',name,'bytes',len(raw),'encoding',encoding,'markers',len(markers))
-                if markers:
-                  p=markers[0].start()
-                  print(s[max(0,p-1000):p+2000])
-              except Exception as e:
-                print('ERROR',name,repr(e))
+                headers={'User-Agent':ua} if ua else {}
+                with urllib.request.urlopen(urllib.request.Request(url,headers=headers),timeout=20) as r:
+                  raw=r.read(100000)
+                s=raw.decode('utf-8',errors='replace')
+                print('URL',url,'UA',ua or 'default','bytes',len(raw),'href',len(re.findall('href=',s,re.I)))
+                print(re.sub(r'\\s+',' ',s[:450]))
+              except Exception as e: print('ERROR',url,ua,repr(e))
           PY
